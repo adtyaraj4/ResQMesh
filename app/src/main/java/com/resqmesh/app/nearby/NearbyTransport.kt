@@ -16,8 +16,11 @@ import com.google.android.gms.nearby.connection.Payload
 import com.google.android.gms.nearby.connection.PayloadCallback
 import com.google.android.gms.nearby.connection.PayloadTransferUpdate
 import com.google.android.gms.nearby.connection.Strategy
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.nio.charset.StandardCharsets
 
@@ -53,6 +56,19 @@ class NearbyTransport(
 
     private val _incomingMessages = MutableStateFlow<List<ReceivedMessage>>(emptyList())
     val incomingMessages: StateFlow<List<ReceivedMessage>> = _incomingMessages.asStateFlow()
+
+    // Additive event stream (does not replace incomingMessages above, which
+    // the Phase 1 test screen still reads). Emits each received message
+    // exactly once as it arrives, so higher layers (NearbyMeshTransport)
+    // can consume it without diffing an accumulating list.
+    private val _messageEvents = MutableSharedFlow<ReceivedMessage>(extraBufferCapacity = 64)
+    val messageEvents: SharedFlow<ReceivedMessage> = _messageEvents.asSharedFlow()
+
+    // Additive: emits the current connected-endpoint id set on every change,
+    // paired with a human-readable name where known, so a MeshTransport
+    // wrapper can build TransportPeer list without re-deriving it.
+    private val _connectionEvents = MutableSharedFlow<Set<String>>(extraBufferCapacity = 16, replay = 1)
+    val connectionEvents: SharedFlow<Set<String>> = _connectionEvents.asSharedFlow()
 
     private val _status = MutableStateFlow("Idle")
     val status: StateFlow<String> = _status.asStateFlow()
@@ -165,6 +181,7 @@ class NearbyTransport(
             when (resolution.status.statusCode) {
                 ConnectionsStatusCodes.STATUS_OK -> {
                     _connectedEndpoints.value = _connectedEndpoints.value + endpointId
+                    _connectionEvents.tryEmit(_connectedEndpoints.value)
                     _status.value = "Connected to $endpointId"
                     Log.d(TAG, "Connected to $endpointId")
                 }
@@ -179,6 +196,7 @@ class NearbyTransport(
 
         override fun onDisconnected(endpointId: String) {
             _connectedEndpoints.value = _connectedEndpoints.value - endpointId
+            _connectionEvents.tryEmit(_connectedEndpoints.value)
             _status.value = "Disconnected from $endpointId"
             Log.d(TAG, "Disconnected from $endpointId")
         }
@@ -209,6 +227,7 @@ class NearbyTransport(
                     receivedAtMillis = System.currentTimeMillis()
                 )
                 _incomingMessages.value = _incomingMessages.value + message
+                _messageEvents.tryEmit(message)
                 Log.d(TAG, "Received from $endpointId: $text")
             }
         }

@@ -1,72 +1,156 @@
-# ResQMesh — Phase 1
+# ResQMesh — Phase 2: BLE Gateway Integration
 
-Milestone: **Phone A ↔ Phone B, offline, no internet, no backend, no LoRa.**
+## Project Progress
 
-## What's in this build
+ResQMesh has progressed from the initial mesh/gateway foundation into **Phase 2**, where the gateway is now connected to the **ResQ Team Android application** using Bluetooth Classic.
 
-| File | Purpose |
-|---|---|
-| `data/NodeIdManager.kt` | Generates a random `NODE-XXXXXX` ID on first launch, persists it in SharedPreferences. Never uses phone number/IMEI. |
-| `nearby/NearbyTransport.kt` | Wraps Google Nearby Connections (`P2P_CLUSTER` strategy): advertising, discovery, auto-connect, and raw byte send/receive. This is **transport only** — no routing/TTL/dedup logic lives here on purpose, so it can be reused unchanged once multi-hop routing is added on top in Phase 3+. |
-| `MainActivity.kt` | Requests runtime permissions (location + Bluetooth + Nearby Wi-Fi Devices depending on API level), then starts advertising + discovery. |
-| `ui/HomeScreen.kt` | Temporary test screen — **not** the final emergency-button UI from the spec. Shows node ID, discovered/connected peer counts, a send-test-packet button, and a log of received packets. |
+### Phase 1 — Mesh / Gateway Foundation
 
-## Why P2P_CLUSTER and not P2P_STAR
+The earlier stage established the core ResQMesh communication path:
 
-`P2P_STAR` limits a device to a single connection, which would cap us at
-two-phone topologies forever. `P2P_CLUSTER` allows a device to hold
-multiple simultaneous connections, which is required for Phase 3
-(three-phone multi-hop: A → B → C). Choosing it now avoids a transport
-rewrite later.
+**People ESP32 → BLE → Gateway/Receiver ESP32**
 
-## How to test (2 physical Android devices, API 26+)
+The gateway receives emergency messages from sender ESP32 nodes over BLE and processes them as the central relay point.
 
-1. Open the project in Android Studio (Koala+ recommended), let Gradle sync.
-2. Turn OFF Wi-Fi internet and mobile data on both phones (Bluetooth and
-   Wi-Fi *radios* should stay on — Nearby Connections needs them; you're
-   only disabling their internet uplink, e.g. airplane mode + re-enable
-   Wi-Fi/Bluetooth, or just no SIM/hotspot).
-3. Install the app (`Run ▶`) on both phones.
-4. Grant all permission prompts on both phones.
-5. Watch the "Transport status" card — it should move from
-   `Advertising as NODE-XXXX` → `Connecting to NODE-YYYY...` →
-   `Connected to <endpointId>` on both devices, usually within a few
-   seconds to ~30s depending on radio conditions.
-6. On Phone A, tap **"Send test packet to connected peers"**.
-7. On Phone B, a new card should appear under "Received packets" showing
-   `From: <endpointId>` and the text `Hello from NODE-A7F2 at <timestamp>`.
-8. Repeat in the other direction.
+### Phase 2 — BLE Gateway → ResQ Team App
 
-### Expected output
-- Both phones show each other's endpoint ID as connected.
-- Sending on either device produces a received card on the other within
-  ~1 second.
-- No internet permission is exercised for this — you can confirm by
-  checking neither phone's data usage indicator moves.
+Phase 2 extends that working gateway by adding the phone-facing communication path:
 
-### Common issues
-- **Stuck on "Discovering peers..."**: one or both phones denied a
-  permission. Check Settings → Apps → ResQMesh → Permissions; Location
-  and Nearby devices must be granted, not just Bluetooth.
-- **Connects then immediately disconnects**: happens if both apps were
-  freshly reinstalled and Bluetooth cache is stale — toggle Bluetooth
-  off/on on both phones.
-- **Works in the same room but not two rooms apart**: expected — this
-  phase uses BLE/Wi-Fi Direct range only (tens of meters). Long range is
-  what the LoRa gateway (Phase 10+) is for.
-- **Emulators**: don't use them for this test — Nearby Connections needs
-  real BLE/Wi-Fi radios, per the project spec.
+**People ESP32 → BLE → Gateway ESP32 → Bluetooth Classic → ResQ Team App**
 
-## What's deliberately NOT here yet
+The gateway ESP32 now:
+- Advertises a BLE service for incoming sender ESP32 nodes.
+- Receives emergency messages through the BLE RX characteristic.
+- Uses Bluetooth Classic with the device name `ResQTeam-ESP32`.
+- Forwards received emergency data to the ResQ Team phone.
+- Sends each forwarded message as a newline-terminated packet so the Android application can read it as a stream of messages.
+- Converts non-JSON incoming messages into a structured ResQ emergency JSON packet for the app.
 
-No multi-hop routing, no message IDs/dedup, no TTL, no GPS, no priority
-queue, no store-and-forward, no ESP32/LoRa, no backend, no encryption.
-Those are Phases 2–17. This build only proves the raw transport works
-between two phones with zero infrastructure.
+## Communication Architecture
 
-## Next step (Phase 2/3)
+```text
+┌─────────────────────┐
+│   People ESP32      │
+│  Emergency Sender   │
+└──────────┬──────────┘
+           │
+           │ BLE
+           ▼
+┌─────────────────────┐
+│  Gateway ESP32      │
+│   RESQMESH-RECEIVER │
+│                     │
+│ BLE RX              │
+│        ↓            │
+│ Message Processing  │
+│        ↓            │
+│ JSON Formatting     │
+│        ↓            │
+│ Bluetooth Classic   │
+└──────────┬──────────┘
+           │
+           │ Bluetooth Classic / SPP
+           ▼
+┌─────────────────────┐
+│   ResQ Team App     │
+│      Android        │
+└─────────────────────┘
+```
 
-Once you've confirmed the above on real hardware, the next step is
-introducing a structured message envelope (message ID + sender + hop
-count) so a third phone can relay what it receives instead of just
-echoing raw text — that's the seed of the mesh routing engine.
+## Gateway BLE Configuration
+
+The receiver uses:
+
+- Device name: `RESQMESH-RECEIVER`
+- Service UUID:
+  `6e400001-b5a3-f393-e0a9-e50e24dcca9e`
+- RX characteristic:
+  `6e400002-b5a3-f393-e0a9-e50e24dcca9e`
+- TX characteristic:
+  `6e400003-b5a3-f393-e0a9-e50e24dcca9e`
+
+The sender ESP32 writes emergency messages to the gateway RX characteristic.
+
+## Phone Gateway Configuration
+
+The receiver ESP32 exposes Bluetooth Classic using:
+
+- Bluetooth device name: `ResQTeam-ESP32`
+- Android connection type: Bluetooth Classic / SPP
+
+The gateway checks whether a phone client is connected before forwarding an emergency packet.
+
+## Message Forwarding
+
+A received message follows this path:
+
+1. Gateway receives the message from the sender ESP32.
+2. The BLE callback captures the message.
+3. The gateway passes it to the phone-forwarding function.
+4. If the incoming message is already JSON, it is forwarded.
+5. If it is plain text, the gateway wraps it into a structured ResQ JSON packet.
+6. The JSON packet is sent using `SerialBT.println()`.
+7. The newline allows the Android app to process each emergency as a separate incoming line.
+
+Example structured packet:
+
+```json
+{
+  "messageId": "ESP32-12345",
+  "sourceNodeId": "SENDER-ESP32",
+  "type": "EMERGENCY",
+  "priority": 5,
+  "latitude": 13.0827,
+  "longitude": 80.2707,
+  "timestamp": 12345,
+  "battery": 90,
+  "ttl": 10,
+  "hopCount": 1,
+  "peopleCount": 1,
+  "injuredCount": 0,
+  "message": "HELP"
+}
+```
+
+## Current Phase 2 Status
+
+### Completed
+
+- [x] Sender ESP32 → Gateway ESP32 BLE communication
+- [x] Gateway BLE server
+- [x] Gateway advertising
+- [x] Gateway message reception callback
+- [x] Bluetooth Classic phone interface
+- [x] `ResQTeam-ESP32` Bluetooth device
+- [x] Gateway-to-phone forwarding
+- [x] Newline-delimited phone messages
+- [x] Structured JSON forwarding for non-JSON emergency messages
+- [x] Gateway serial logging for connection and forwarding status
+
+### Next Development
+
+The next stage can build on this gateway-to-app link to improve the complete rescue workflow, including richer emergency information, priority handling, location presentation, navigation, acknowledgement/status handling, and more robust multi-node operation.
+
+## Hardware Communication
+
+### Sender ESP32
+
+The sender node is responsible for transmitting emergency information into the ResQMesh BLE network.
+
+### Gateway ESP32
+
+The gateway acts as the bridge between the local ESP32 mesh and the ResQ Team Android application.
+
+### ResQ Team Phone
+
+The phone connects to the gateway using Bluetooth Classic and receives the forwarded emergency packets.
+
+## Notes
+
+This repository represents **Phase 2** of the ResQMesh development process. LoRa support remains optional/future work in the gateway firmware and is not required for the current BLE-to-phone communication path.
+
+---
+
+**ResQMesh — Phase 2**
+
+Emergency communication from the field node to the rescue team's phone is now bridged through the gateway.
