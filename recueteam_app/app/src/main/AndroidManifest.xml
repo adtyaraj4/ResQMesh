@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Bluetooth Classic (RFCOMM/SPP) to the ResQTeam-ESP32 gateway -->
+    <!-- Legacy Bluetooth permissions (API <= 30) -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+    <!-- Needed pre-31 because classic BT scanning/bonding is treated as location-adjacent -->
+    <uses-permission
+        android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="30" />
+
+    <!-- API 31+ granular Bluetooth permissions -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+
+    <!-- Critical emergency alerts -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- We only ever talk to an already-paired classic Bluetooth device -->
+    <uses-feature
+        android:name="android.hardware.bluetooth"
+        android:required="true" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.ResQTeam"
+        android:supportsRtl="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.ResQTeam">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+
+</manifest>
