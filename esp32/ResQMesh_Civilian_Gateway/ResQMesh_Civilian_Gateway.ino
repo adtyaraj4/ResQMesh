@@ -1,331 +1,909 @@
-/*
- * ResQMesh_Civilian_Gateway.ino
- *
- * BLE <-> LoRa gateway for the civilian side of ResQMesh.
- *
- * Flow:
- *   Phone (BLE central) --write--> RX characteristic --> validate/dedup --> LoRa TX
- *   LoRa RX --> validate/dedup --> TX characteristic --notify--> Phone (BLE central)
- *
- * Hardware: ESP32 DevKit V1 / ESP32-WROOM-32 + Ai-Thinker Ra-02 (SX1278)
- *
- * Required Arduino libraries (install via Library Manager):
- *   - "LoRa" by Sandeep Mistry
- *   - "ArduinoJson" by Benoit Blanchon (v6.x)
- *   - ESP32 BLE Arduino (bundled with the ESP32 board package, no separate install)
- *
- * Board package: esp32 by Espressif Systems (installed via Boards Manager)
- *
- * NOT YET FLASHED/TESTED ON HARDWARE BY ME — I have no ESP32/Ra-02 in
- * this environment. This follows the standard Arduino-ESP32 BLE
- * peripheral pattern and the documented "LoRa" library API, but you
- * should watch the Serial Monitor (115200 baud) on first flash to
- * confirm LoRa.begin() succeeds and the BLE service starts advertising
- * before assuming the radio config is correct.
- *
- * ===========================================================
- *                  CONFIGURATION SECTION
- * ===========================================================
- * Every pin and radio parameter that might need to change for your
- * physical wiring lives here. Nothing below this section should need
- * editing for a rewiring.
- */
-
-#include <SPI.h>
-#include <LoRa.h>
-#include <ArduinoJson.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-// ---- BLE identity ----
-#define BLE_DEVICE_NAME        "RESQMESH-GW"
-#define SERVICE_UUID            "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
-#define CHARACTERISTIC_UUID_RX  "6e400002-b5a3-f393-e0a9-e50e24dcca9e" // phone writes here
-#define CHARACTERISTIC_UUID_TX  "6e400003-b5a3-f393-e0a9-e50e24dcca9e" // ESP32 notifies here
 
-// ---- Node identity (NOT phone IMEI/number — a fixed gateway id) ----
-#define GATEWAY_NODE_ID         "GW-CIVILIAN-001"
+// ============================================================
+// OPTIONAL LORA
+// Currently disabled
+// ============================================================
 
-// ---- Ra-02 (SX1278) SPI pin mapping — conventional VSPI on ESP32 DevKit V1 ----
-// Change these if your physical wiring differs. Nothing else in this
-// file needs to change for a rewiring.
-#define LORA_SCK   18
-#define LORA_MISO  19
-#define LORA_MOSI  23
-#define LORA_SS    5
-#define LORA_RST   14
-#define LORA_DIO0  26
+// #include <SPI.h>
+// #include <LoRa.h>
 
-// ---- LoRa radio settings ----
-// LORA_FREQUENCY confirmed as 433 MHz for these Ra-02 modules.
-// Both the civilian and rescue gateways MUST use this identical value.
-#define LORA_FREQUENCY           433E6
-#define LORA_BANDWIDTH           125E3
-#define LORA_SPREADING_FACTOR    7
-#define LORA_CODING_RATE         5      // 4/5
-#define LORA_SYNC_WORD           0x12   // private-network sync word, not the LoRaWAN public default
-#define LORA_TX_POWER            17     // dBm
+#define LORA_SCK        18
+#define LORA_MISO       19
+#define LORA_MOSI       23
+#define LORA_SS         5
+#define LORA_RST        14
+#define LORA_DIO0       2
 
-// ---- Packet handling ----
-#define MAX_PACKET_JSON_BYTES    512
-#define SEEN_CACHE_SIZE          32     // recently-seen messageIds, ring buffer
+#define LORA_FREQUENCY  433E6
 
-// ===========================================================
-//                    STATE
-// ===========================================================
+#define USE_LORA        false
 
-BLECharacteristic *txCharacteristic;
-bool bleDeviceConnected = false;
-bool oldBleDeviceConnected = false;
 
-String seenMessageIds[SEEN_CACHE_SIZE];
-int seenCacheIndex = 0;
+// ============================================================
+// PEOPLE PHONE BLE
+// ============================================================
 
-unsigned long packetsSentLora = 0;
-unsigned long packetsReceivedLora = 0;
-unsigned long packetsFromPhone = 0;
-unsigned long duplicatesDropped = 0;
+#define PEOPLE_DEVICE_NAME "RESQMESH-GW"
 
-// ===========================================================
-//                 DUPLICATE CACHE
-// ===========================================================
+#define SERVICE_UUID \
+    "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 
-bool isDuplicate(const String &messageId) {
-  for (int i = 0; i < SEEN_CACHE_SIZE; i++) {
-    if (seenMessageIds[i] == messageId) return true;
-  }
-  return false;
-}
+#define RX_CHARACTERISTIC_UUID \
+    "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 
-void markSeen(const String &messageId) {
-  seenMessageIds[seenCacheIndex] = messageId;
-  seenCacheIndex = (seenCacheIndex + 1) % SEEN_CACHE_SIZE;
-}
+#define TX_CHARACTERISTIC_UUID \
+    "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
-// ===========================================================
-//                 PACKET VALIDATION
-// ===========================================================
 
-// Returns true if the JSON document has the minimum required fields
-// with sane types. Does not mutate doc.
-bool isValidPacket(JsonDocument &doc) {
-  if (!doc.containsKey("messageId") || !doc["messageId"].is<const char*>()) return false;
-  if (!doc.containsKey("sourceNodeId") || !doc["sourceNodeId"].is<const char*>()) return false;
-  if (!doc.containsKey("type") || !doc["type"].is<const char*>()) return false;
-  if (!doc.containsKey("ttl") || !doc["ttl"].is<int>()) return false;
-  if (doc["ttl"].as<int>() <= 0) return false;
-  if (!doc.containsKey("version") || doc["version"].as<int>() != 1) return false;
-  return true;
-}
+// ============================================================
+// RECEIVER ESP32
+// ============================================================
 
-// ===========================================================
-//                 LORA SEND
-// ===========================================================
+#define RECEIVER_DEVICE_NAME "RESQMESH-RECEIVER"
 
-void sendOverLora(const String &json) {
-  if (json.length() > MAX_PACKET_JSON_BYTES) {
-    Serial.println("[LoRa TX] Packet too large, dropping: " + String(json.length()) + " bytes");
-    return;
-  }
-  LoRa.beginPacket();
-  LoRa.print(json);
-  LoRa.endPacket();
-  packetsSentLora++;
-  Serial.println("[LoRa TX] " + json);
-}
 
-// ===========================================================
-//                 BLE NOTIFY (ESP32 -> Phone)
-// ===========================================================
+// ============================================================
+// GLOBALS
+// ============================================================
 
-void notifyPhone(const String &json) {
-  if (!bleDeviceConnected) {
-    Serial.println("[BLE TX] No phone connected, dropping notification");
-    return;
-  }
-  txCharacteristic->setValue((uint8_t *)json.c_str(), json.length());
-  txCharacteristic->notify();
-  Serial.println("[BLE TX] " + json);
-}
+BLECharacteristic* phoneTxCharacteristic = nullptr;
 
-// ===========================================================
-//         INCOMING FROM PHONE (BLE write to RX)
-// ===========================================================
+BLEClient* receiverClient = nullptr;
 
-class RxCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *characteristic) override {
-    String value = String(characteristic->getValue().c_str());
-    if (value.length() == 0) return;
+BLERemoteCharacteristic* receiverRxCharacteristic = nullptr;
 
-    packetsFromPhone++;
-    Serial.println("[BLE RX] " + value);
 
-    StaticJsonDocument<MAX_PACKET_JSON_BYTES> doc;
-    DeserializationError err = deserializeJson(doc, value);
-    if (err) {
-      Serial.println("[BLE RX] JSON parse error: " + String(err.c_str()));
-      return;
-    }
-    if (!isValidPacket(doc)) {
-      Serial.println("[BLE RX] Packet failed validation, dropping");
-      return;
+// Phone connection
+bool phoneConnected = false;
+
+// Receiver connection
+bool receiverConnected = false;
+
+
+// ============================================================
+// MESSAGE QUEUE
+// ============================================================
+
+// Message received from the phone.
+// We store it first and forward it from loop().
+String pendingMessage = "";
+
+bool messagePending = false;
+
+
+// ============================================================
+// LORA SETUP
+// ============================================================
+
+void setupLoRa() {
+
+    if (!USE_LORA) {
+
+        Serial.println("[LoRa] Disabled.");
+
+        return;
     }
 
-    String messageId = doc["messageId"].as<String>();
-    if (isDuplicate(messageId)) {
-      duplicatesDropped++;
-      Serial.println("[BLE RX] Duplicate messageId, dropping: " + messageId);
-      return;
-    }
-    markSeen(messageId);
 
-    // Forward exactly as received onto LoRa. TTL/hopCount are the
-    // phone-side mesh's responsibility to have already decremented
-    // before it reaches the gateway; the gateway does not re-decrement
-    // here, it's a bridge, not another mesh hop in the phone-side sense.
-    String reSerialized;
-    serializeJson(doc, reSerialized);
-    sendOverLora(reSerialized);
-  }
+    /*
+    SPI.begin(
+        LORA_SCK,
+        LORA_MISO,
+        LORA_MOSI,
+        LORA_SS
+    );
+
+
+    LoRa.setPins(
+        LORA_SS,
+        LORA_RST,
+        LORA_DIO0
+    );
+
+
+    if (!LoRa.begin(LORA_FREQUENCY)) {
+
+        Serial.println("[LoRa] FAILED!");
+
+        return;
+    }
+
+
+    Serial.println("[LoRa] Started.");
+    */
+}
+
+
+// ============================================================
+// CONNECT TO RECEIVER
+// ============================================================
+
+bool connectToReceiver() {
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("       SEARCHING FOR RECEIVER");
+    Serial.println("========================================");
+
+
+    BLEScan* scan =
+        BLEDevice::getScan();
+
+
+    scan->setActiveScan(true);
+
+
+    BLEScanResults* results =
+        scan->start(5, false);
+
+
+    BLEAdvertisedDevice* receiverDevice =
+        nullptr;
+
+
+    // --------------------------------------------------------
+    // SEARCH SCAN RESULTS
+    // --------------------------------------------------------
+
+    for (int i = 0; i < results->getCount(); i++) {
+
+        BLEAdvertisedDevice device =
+            results->getDevice(i);
+
+
+        if (!device.haveName()) {
+            continue;
+        }
+
+
+        String name =
+            device.getName().c_str();
+
+
+        Serial.print("[BLE] Found device: ");
+        Serial.println(name);
+
+
+        if (name == RECEIVER_DEVICE_NAME) {
+
+            receiverDevice =
+                new BLEAdvertisedDevice(device);
+
+            break;
+        }
+    }
+
+
+    // --------------------------------------------------------
+    // RECEIVER NOT FOUND
+    // --------------------------------------------------------
+
+    if (receiverDevice == nullptr) {
+
+        Serial.println(
+            "[BLE] Receiver NOT found."
+        );
+
+        scan->clearResults();
+
+        return false;
+    }
+
+
+    Serial.println(
+        "[BLE] Receiver found!"
+    );
+
+
+    // --------------------------------------------------------
+    // CREATE BLE CLIENT
+    // --------------------------------------------------------
+
+    if (receiverClient != nullptr) {
+
+        if (receiverClient->isConnected()) {
+
+            receiverClient->disconnect();
+        }
+
+        delete receiverClient;
+
+        receiverClient = nullptr;
+    }
+
+
+    receiverClient =
+        BLEDevice::createClient();
+
+
+    // --------------------------------------------------------
+    // CONNECT
+    // --------------------------------------------------------
+
+    Serial.println(
+        "[BLE] Connecting to receiver..."
+    );
+
+
+    if (!receiverClient->connect(receiverDevice)) {
+
+        Serial.println(
+            "[BLE] FAILED to connect to receiver."
+        );
+
+
+        delete receiverDevice;
+
+        scan->clearResults();
+
+        receiverConnected = false;
+
+        return false;
+    }
+
+
+    Serial.println(
+        "[BLE] Connected to receiver!"
+    );
+
+
+    // --------------------------------------------------------
+    // FIND SERVICE
+    // --------------------------------------------------------
+
+    BLERemoteService* service =
+        receiverClient->getService(
+            SERVICE_UUID
+        );
+
+
+    if (service == nullptr) {
+
+        Serial.println(
+            "[BLE] Receiver service NOT found."
+        );
+
+
+        receiverClient->disconnect();
+
+        delete receiverDevice;
+
+        scan->clearResults();
+
+        receiverConnected = false;
+
+        return false;
+    }
+
+
+    Serial.println(
+        "[BLE] Receiver service found."
+    );
+
+
+    // --------------------------------------------------------
+    // FIND RX CHARACTERISTIC
+    // --------------------------------------------------------
+
+    receiverRxCharacteristic =
+        service->getCharacteristic(
+            RX_CHARACTERISTIC_UUID
+        );
+
+
+    if (receiverRxCharacteristic == nullptr) {
+
+        Serial.println(
+            "[BLE] Receiver RX characteristic NOT found."
+        );
+
+
+        receiverClient->disconnect();
+
+        delete receiverDevice;
+
+        scan->clearResults();
+
+        receiverConnected = false;
+
+        return false;
+    }
+
+
+    Serial.println(
+        "[BLE] Receiver RX characteristic found."
+    );
+
+
+    // --------------------------------------------------------
+    // CHECK WRITE SUPPORT
+    // --------------------------------------------------------
+
+    Serial.print(
+        "[BLE] Can write: "
+    );
+
+    Serial.println(
+        receiverRxCharacteristic->canWrite()
+            ? "YES"
+            : "NO"
+    );
+
+
+    Serial.print(
+        "[BLE] Can write without response: "
+    );
+
+    Serial.println(
+        receiverRxCharacteristic->canWriteNoResponse()
+            ? "YES"
+            : "NO"
+    );
+
+
+    if (!receiverRxCharacteristic->canWrite() &&
+        !receiverRxCharacteristic->canWriteNoResponse()) {
+
+        Serial.println(
+            "[BLE] ERROR: RX characteristic is not writable!"
+        );
+
+
+        receiverClient->disconnect();
+
+        delete receiverDevice;
+
+        scan->clearResults();
+
+        receiverConnected = false;
+
+        return false;
+    }
+
+
+    // --------------------------------------------------------
+    // READY
+    // --------------------------------------------------------
+
+    receiverConnected = true;
+
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("       RECEIVER COMMUNICATION READY");
+    Serial.println("========================================");
+
+
+    delete receiverDevice;
+
+    scan->clearResults();
+
+
+    return true;
+}
+
+
+// ============================================================
+// FORWARD MESSAGE TO RECEIVER
+// ============================================================
+
+bool forwardToReceiver(String message) {
+
+    message.trim();
+
+
+    if (message.length() == 0) {
+
+        return false;
+    }
+
+
+    // --------------------------------------------------------
+    // CHECK CONNECTION
+    // --------------------------------------------------------
+
+    if (receiverClient == nullptr ||
+        !receiverClient->isConnected() ||
+        receiverRxCharacteristic == nullptr) {
+
+        Serial.println(
+            "[BLE] Receiver is NOT connected."
+        );
+
+        receiverConnected = false;
+
+        return false;
+    }
+
+
+    // --------------------------------------------------------
+    // DISPLAY MESSAGE
+    // --------------------------------------------------------
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("       FORWARDING TO RECEIVER");
+    Serial.println("========================================");
+
+    Serial.print("Message length: ");
+    Serial.println(message.length());
+
+    Serial.println();
+
+    Serial.println(message);
+
+    Serial.println();
+
+
+    // --------------------------------------------------------
+    // WRITE TO RECEIVER
+    // --------------------------------------------------------
+
+    Serial.println(
+        "[BLE] Writing message..."
+    );
+
+
+    bool success =
+        receiverRxCharacteristic->writeValue(
+            message,
+            true
+        );
+
+
+    // --------------------------------------------------------
+    // CHECK RESULT
+    // --------------------------------------------------------
+
+    if (success) {
+
+        Serial.println(
+            "[BLE] WRITE SUCCESS!"
+        );
+
+        Serial.println(
+            "[BLE] Receiver acknowledged the message."
+        );
+
+    } else {
+
+        Serial.println(
+            "[BLE] WRITE FAILED!"
+        );
+
+        receiverConnected = false;
+    }
+
+
+    Serial.println(
+        "========================================"
+    );
+
+
+    return success;
+}
+
+
+// ============================================================
+// PEOPLE PHONE BLE CALLBACKS
+// ============================================================
+
+class ServerCallbacks :
+    public BLEServerCallbacks {
+
+public:
+
+    void onConnect(
+        BLEServer* server
+    ) override {
+
+        phoneConnected = true;
+
+
+        Serial.println();
+        Serial.println("========================================");
+        Serial.println("       PEOPLE PHONE CONNECTED");
+        Serial.println("========================================");
+    }
+
+
+    void onDisconnect(
+        BLEServer* server
+    ) override {
+
+        phoneConnected = false;
+
+
+        Serial.println();
+        Serial.println(
+            "       PEOPLE PHONE DISCONNECTED"
+        );
+
+
+        delay(200);
+
+
+        server->getAdvertising()->start();
+    }
 };
 
-// ===========================================================
-//         INCOMING FROM LORA (Rescue gateway, eventually)
-// ===========================================================
 
-void pollLora() {
-  int packetSize = LoRa.parsePacket();
-  if (packetSize == 0) return;
+// ============================================================
+// PEOPLE PHONE → SENDER ESP32
+// ============================================================
 
-  String received = "";
-  while (LoRa.available()) {
-    received += (char)LoRa.read();
-  }
-  packetsReceivedLora++;
-  Serial.println("[LoRa RX] RSSI=" + String(LoRa.packetRssi()) + " " + received);
+class PhoneRxCallbacks :
+    public BLECharacteristicCallbacks {
 
-  StaticJsonDocument<MAX_PACKET_JSON_BYTES> doc;
-  DeserializationError err = deserializeJson(doc, received);
-  if (err) {
-    Serial.println("[LoRa RX] JSON parse error: " + String(err.c_str()));
-    return;
-  }
-  if (!isValidPacket(doc)) {
-    Serial.println("[LoRa RX] Packet failed validation, dropping");
-    return;
-  }
+public:
 
-  String messageId = doc["messageId"].as<String>();
-  if (isDuplicate(messageId)) {
-    duplicatesDropped++;
-    Serial.println("[LoRa RX] Duplicate messageId, dropping: " + messageId);
-    return;
-  }
-  markSeen(messageId);
+    void onWrite(
+        BLECharacteristic* characteristic
+    ) override {
 
-  String reSerialized;
-  serializeJson(doc, reSerialized);
-  notifyPhone(reSerialized);
-}
 
-// ===========================================================
-//                 BLE CONNECTION CALLBACKS
-// ===========================================================
+        // ----------------------------------------------------
+        // GET MESSAGE FROM PHONE
+        // ----------------------------------------------------
 
-class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *server) override {
-    bleDeviceConnected = true;
-    Serial.println("[BLE] Phone connected");
-  }
-  void onDisconnect(BLEServer *server) override {
-    bleDeviceConnected = false;
-    Serial.println("[BLE] Phone disconnected, resuming advertising");
-  }
+        String message =
+            characteristic->getValue().c_str();
+
+
+        if (message.length() == 0) {
+
+            return;
+        }
+
+
+        // ----------------------------------------------------
+        // DISPLAY MESSAGE
+        // ----------------------------------------------------
+
+        Serial.println();
+        Serial.println("========================================");
+        Serial.println("       MESSAGE FROM PEOPLE PHONE");
+        Serial.println("========================================");
+
+        Serial.print("Message length: ");
+        Serial.println(message.length());
+
+        Serial.println();
+
+        Serial.println(message);
+
+        Serial.println();
+
+
+        // ----------------------------------------------------
+        // STORE MESSAGE
+        //
+        // IMPORTANT:
+        // Do NOT perform another BLE write directly inside
+        // this callback.
+        // ----------------------------------------------------
+
+        pendingMessage = message;
+
+        messagePending = true;
+
+
+        Serial.println(
+            "[BLE] Message queued for receiver."
+        );
+
+
+        // ----------------------------------------------------
+        // FUTURE LORA
+        // ----------------------------------------------------
+
+        if (USE_LORA) {
+
+            /*
+            LoRa.beginPacket();
+
+            LoRa.print(message);
+
+            LoRa.endPacket();
+            */
+        }
+    }
 };
 
-// ===========================================================
-//                       SETUP
-// ===========================================================
+
+// ============================================================
+// START PEOPLE PHONE BLE SERVER
+// ============================================================
+
+void setupPeopleBLE() {
+
+    Serial.println(
+        "[BLE] Starting People Phone BLE..."
+    );
+
+
+    // --------------------------------------------------------
+    // INITIALIZE BLE
+    // --------------------------------------------------------
+
+    if (!BLEDevice::init(
+            PEOPLE_DEVICE_NAME
+        )) {
+
+        Serial.println(
+            "[BLE] BLE initialization FAILED!"
+        );
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // CREATE SERVER
+    // --------------------------------------------------------
+
+    BLEServer* server =
+        BLEDevice::createServer();
+
+
+    server->setCallbacks(
+        new ServerCallbacks()
+    );
+
+
+    // --------------------------------------------------------
+    // CREATE SERVICE
+    // --------------------------------------------------------
+
+    BLEService* service =
+        server->createService(
+            SERVICE_UUID
+        );
+
+
+    // --------------------------------------------------------
+    // RX CHARACTERISTIC
+    //
+    // Phone writes messages here.
+    // --------------------------------------------------------
+
+    BLECharacteristic* rx =
+        service->createCharacteristic(
+
+            RX_CHARACTERISTIC_UUID,
+
+            BLECharacteristic::PROPERTY_WRITE |
+            BLECharacteristic::PROPERTY_WRITE_NR
+        );
+
+
+    rx->setCallbacks(
+        new PhoneRxCallbacks()
+    );
+
+
+    // --------------------------------------------------------
+    // TX CHARACTERISTIC
+    //
+    // Used for future notifications.
+    // --------------------------------------------------------
+
+    phoneTxCharacteristic =
+        service->createCharacteristic(
+
+            TX_CHARACTERISTIC_UUID,
+
+            BLECharacteristic::PROPERTY_NOTIFY
+        );
+
+
+    phoneTxCharacteristic->addDescriptor(
+        new BLE2902()
+    );
+
+
+    // --------------------------------------------------------
+    // START SERVICE
+    // --------------------------------------------------------
+
+    service->start();
+
+
+    // --------------------------------------------------------
+    // ADVERTISE
+    // --------------------------------------------------------
+
+    BLEAdvertising* advertising =
+        BLEDevice::getAdvertising();
+
+
+    advertising->addServiceUUID(
+        SERVICE_UUID
+    );
+
+
+    advertising->setScanResponse(true);
+
+
+    BLEDevice::startAdvertising();
+
+
+    Serial.println(
+        "[BLE] People BLE ready."
+    );
+
+
+    Serial.print(
+        "[BLE] Device name: "
+    );
+
+    Serial.println(
+        PEOPLE_DEVICE_NAME
+    );
+}
+
+
+// ============================================================
+// SETUP
+// ============================================================
 
 void setup() {
-  Serial.begin(115200);
-  delay(300);
-  Serial.println("\n=== ResQMesh Civilian Gateway ===");
-  Serial.println("Node ID: " GATEWAY_NODE_ID);
 
-  // ---- LoRa init ----
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
-  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+    Serial.begin(115200);
 
-  if (!LoRa.begin(LORA_FREQUENCY)) {
-    Serial.println("[LoRa] begin() FAILED — check wiring/frequency, halting");
-    while (true) { delay(1000); }
-  }
-  LoRa.setSignalBandwidth(LORA_BANDWIDTH);
-  LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR);
-  LoRa.setCodingRate4(LORA_CODING_RATE);
-  LoRa.setSyncWord(LORA_SYNC_WORD);
-  LoRa.setTxPower(LORA_TX_POWER);
-  Serial.println("[LoRa] Radio initialized OK");
 
-  // ---- BLE init (peripheral/server role — the phone is central) ----
-  BLEDevice::init(BLE_DEVICE_NAME);
-  BLEServer *server = BLEDevice::createServer();
-  server->setCallbacks(new ServerCallbacks());
+    delay(1000);
 
-  BLEService *service = server->createService(SERVICE_UUID);
 
-  BLECharacteristic *rxCharacteristic = service->createCharacteristic(
-      CHARACTERISTIC_UUID_RX,
-      BLECharacteristic::PROPERTY_WRITE
-  );
-  rxCharacteristic->setCallbacks(new RxCallbacks());
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("       RESQMESH SENDER ESP32");
+    Serial.println("========================================");
 
-  txCharacteristic = service->createCharacteristic(
-      CHARACTERISTIC_UUID_TX,
-      BLECharacteristic::PROPERTY_NOTIFY
-  );
-  txCharacteristic->addDescriptor(new BLE2902()); // required for notifications (CCCD)
 
-  service->start();
+    // --------------------------------------------------------
+    // LORA
+    // --------------------------------------------------------
 
-  BLEAdvertising *advertising = BLEDevice::getAdvertising();
-  advertising->addServiceUUID(SERVICE_UUID);
-  advertising->setScanResponse(true);
-  BLEDevice::startAdvertising();
-  Serial.println("[BLE] Advertising as " BLE_DEVICE_NAME);
+    setupLoRa();
+
+
+    // --------------------------------------------------------
+    // START PEOPLE PHONE BLE SERVER
+    // --------------------------------------------------------
+
+    setupPeopleBLE();
+
+
+    // --------------------------------------------------------
+    // GIVE BLE SERVER TIME TO START
+    // --------------------------------------------------------
+
+    delay(2000);
+
+
+    // --------------------------------------------------------
+    // CONNECT SENDER → RECEIVER
+    // --------------------------------------------------------
+
+    connectToReceiver();
+
+
+    // --------------------------------------------------------
+    // READY
+    // --------------------------------------------------------
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("       SENDER READY");
+    Serial.println("========================================");
+
+    Serial.println(
+        "Waiting for People Phone..."
+    );
+
+    Serial.println(
+        "Waiting for Receiver ESP32..."
+    );
+
+    Serial.println();
 }
 
-// ===========================================================
-//                       LOOP
-// ===========================================================
+
+// ============================================================
+// LOOP
+// ============================================================
 
 void loop() {
-  pollLora();
 
-  // Standard Arduino-ESP32 BLE re-advertise idiom: startAdvertising()
-  // is not automatically resumed after a disconnect on some core
-  // versions, so we restart it explicitly.
-  if (!bleDeviceConnected && oldBleDeviceConnected) {
-    delay(200);
-    BLEDevice::startAdvertising();
-    Serial.println("[BLE] Re-advertising after disconnect");
-    oldBleDeviceConnected = bleDeviceConnected;
-  }
-  if (bleDeviceConnected && !oldBleDeviceConnected) {
-    oldBleDeviceConnected = bleDeviceConnected;
-  }
 
-  // Lightweight periodic diagnostics — useful during bring-up, cheap to
-  // leave in for the demo.
-  static unsigned long lastStatsPrint = 0;
-  if (millis() - lastStatsPrint > 10000) {
-    lastStatsPrint = millis();
-    Serial.printf(
-      "[STATS] fromPhone=%lu loraTx=%lu loraRx=%lu duplicates=%lu bleConnected=%d\n",
-      packetsFromPhone, packetsSentLora, packetsReceivedLora, duplicatesDropped, bleDeviceConnected
-    );
-  }
+    // ========================================================
+    // HANDLE PENDING PHONE MESSAGE
+    // ========================================================
+
+    if (messagePending) {
+
+        // Copy message locally
+
+        String messageToSend =
+            pendingMessage;
+
+
+        // Clear queue BEFORE sending
+
+        pendingMessage = "";
+
+        messagePending = false;
+
+
+        // ----------------------------------------------------
+        // Make sure receiver is connected
+        // ----------------------------------------------------
+
+        if (!receiverConnected) {
+
+            Serial.println(
+                "[BLE] Receiver disconnected."
+            );
+
+            Serial.println(
+                "[BLE] Attempting reconnection..."
+            );
+
+
+            connectToReceiver();
+        }
+
+
+        // ----------------------------------------------------
+        // Forward message
+        // ----------------------------------------------------
+
+        if (receiverConnected) {
+
+            forwardToReceiver(
+                messageToSend
+            );
+
+        } else {
+
+            Serial.println(
+                "[BLE] Cannot forward message."
+            );
+
+            Serial.println(
+                "[BLE] Receiver unavailable."
+            );
+        }
+    }
+
+
+    // ========================================================
+    // AUTOMATIC RECEIVER RECONNECTION
+    // ========================================================
+
+    static unsigned long lastAttempt = 0;
+
+
+    if (!receiverConnected) {
+
+        if (millis() - lastAttempt > 5000) {
+
+            lastAttempt = millis();
+
+            connectToReceiver();
+        }
+    }
+
+
+    // ========================================================
+    // SMALL LOOP DELAY
+    // ========================================================
+
+    delay(20);
 }

@@ -1,0 +1,4 @@
+com.resqmesh.app.test.app-androidTest-0 C:\Users\Aditya\Downloads\ResQMesh-MVP\ResQMesh\app\build\generated\res\resValues\androidTest\debug
+com.resqmesh.app.test.app-mergeDebugAndroidTestResources-1 C:\Users\Aditya\Downloads\ResQMesh-MVP\ResQMesh\app\build\intermediates\incremental\debugAndroidTest\mergeDebugAndroidTestResources\merged.dir
+com.resqmesh.app.test.app-mergeDebugAndroidTestResources-2 C:\Users\Aditya\Downloads\ResQMesh-MVP\ResQMesh\app\build\intermediates\incremental\debugAndroidTest\mergeDebugAndroidTestResources\stripped.dir
+com.resqmesh.app.test.app-debugAndroidTest-3 C:\Users\Aditya\Downloads\ResQMesh-MVP\ResQMesh\app\build\intermediates\merged_res\debugAndroidTest\mergeDebugAndroidTestResources

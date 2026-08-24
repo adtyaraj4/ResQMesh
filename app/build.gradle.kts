@@ -1,7 +1,6 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
-    id("org.jetbrains.kotlin.plugin.compose")
     id("org.jetbrains.kotlin.plugin.serialization")
 }
 
@@ -13,8 +12,8 @@ android {
         applicationId = "com.resqmesh.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.2.0-mesh-core"
+        versionCode = 4
+        versionName = "0.4.0-mvp-3phone-mesh"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -37,6 +36,9 @@ android {
 
     buildFeatures {
         compose = true
+    }
+    composeOptions {
+        kotlinCompilerExtensionVersion = "1.5.14"
     }
 }
 

@@ -9,38 +9,35 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.Divider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.resqmesh.app.nearby.NearbyTransport
+import com.resqmesh.app.mesh.GatewayConnectionState
+import com.resqmesh.app.mesh.MeshPacketType
+import com.resqmesh.app.mesh.NetworkStats
 
-/**
- * Phase 1 test screen.
- *
- * This is intentionally NOT the final emergency-button home screen from
- * Section 6 of the spec yet. It exists to verify the offline transport
- * milestone: Node ID display, peer discovery/connection status, and a
- * button to send + a log to view a simple text packet between two phones.
- * The full emergency UI (🚨 I'M TRAPPED etc.) comes in the next phase
- * once this transport is confirmed working on real hardware.
- */
 @Composable
 fun HomeScreen(
     nodeId: String,
-    status: String,
-    discoveredCount: Int,
-    connectedEndpoints: List<String>,
-    messages: List<NearbyTransport.ReceivedMessage>,
-    onSendTestPacket: () -> Unit
+    nearbyNodeCount: Int,
+    gatewayState: GatewayConnectionState,
+    batteryPercent: Int?,
+    networkStats: NetworkStats,
+    onEmergency: (MeshPacketType) -> Unit,
+    onOpenMessages: () -> Unit,
+    onOpenNetwork: () -> Unit
 ) {
     Scaffold { padding ->
         Column(
@@ -50,55 +47,94 @@ fun HomeScreen(
                 .padding(16.dp)
         ) {
             Text(
-                text = "RESQMESH — PHASE 1 TEST",
-                style = MaterialTheme.typography.titleLarge
+                text = "RESQMESH",
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.Bold
             )
-            Spacer(Modifier.height(4.dp))
             Text(
-                text = "Offline peer-to-peer transport verification",
-                style = MaterialTheme.typography.bodySmall
+                text = "OFFLINE EMERGENCY COMMUNICATION",
+                style = MaterialTheme.typography.labelMedium
             )
 
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(12.dp))
 
-            InfoCard(label = "Node ID", value = nodeId)
-            Spacer(Modifier.height(8.dp))
-            InfoCard(label = "Transport status", value = status)
-            Spacer(Modifier.height(8.dp))
-            InfoCard(label = "Nearby nodes discovered", value = discoveredCount.toString())
-            Spacer(Modifier.height(8.dp))
-            InfoCard(
-                label = "Connected nodes (${connectedEndpoints.size})",
-                value = if (connectedEndpoints.isEmpty()) "None yet" else connectedEndpoints.joinToString()
+            StatusRow(
+                meshActive = nearbyNodeCount > 0,
+                gatewayState = gatewayState
             )
 
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(8.dp))
 
-            Button(
-                onClick = onSendTestPacket,
-                modifier = Modifier.fillMaxWidth(),
-                enabled = connectedEndpoints.isNotEmpty()
-            ) {
-                Text("Send test packet to connected peers")
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    InfoLine("Node", nodeId)
+                    InfoLine("Nearby Nodes", nearbyNodeCount.toString())
+                    InfoLine("Battery", batteryPercent?.let { "$it%" } ?: "Unknown")
+                    InfoLine("Queued", networkStats.queued.toString())
+                }
             }
 
-            Spacer(Modifier.height(16.dp))
-            Text("Received packets", style = MaterialTheme.typography.titleMedium)
-            Divider(modifier = Modifier.padding(vertical = 4.dp))
+            Spacer(Modifier.height(20.dp))
 
-            LazyColumn(
-                verticalArrangement = Arrangement.spacedBy(6.dp)
+            Button(
+                onClick = { onEmergency(MeshPacketType.TRAPPED) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(64.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828))
             ) {
-                items(messages.reversed()) { msg ->
-                    Card(modifier = Modifier.fillMaxWidth()) {
-                        Column(modifier = Modifier.padding(10.dp)) {
-                            Text(
-                                "From: ${msg.fromEndpointId}",
-                                style = MaterialTheme.typography.labelMedium
-                            )
-                            Text(msg.text, style = MaterialTheme.typography.bodyMedium)
-                        }
-                    }
+                Text("🚨 I'M IN DANGER", style = MaterialTheme.typography.titleMedium)
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                EmergencyButton(
+                    label = "🏥 MEDICAL",
+                    modifier = Modifier.weight(1f),
+                    color = Color(0xFFC62828)
+                ) { onEmergency(MeshPacketType.MEDICAL) }
+                EmergencyButton(
+                    label = "🚗 EVACUATION",
+                    modifier = Modifier.weight(1f),
+                    color = Color(0xFFEF6C00)
+                ) { onEmergency(MeshPacketType.EVACUATION) }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                EmergencyButton(
+                    label = "📦 SUPPLIES",
+                    modifier = Modifier.weight(1f),
+                    color = Color(0xFF6D4C41)
+                ) { onEmergency(MeshPacketType.SUPPLIES) }
+                EmergencyButton(
+                    label = "🟢 SAFE",
+                    modifier = Modifier.weight(1f),
+                    color = Color(0xFF2E7D32)
+                ) { onEmergency(MeshPacketType.SAFE) }
+            }
+
+            Spacer(Modifier.height(24.dp))
+            Divider()
+            Spacer(Modifier.height(12.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                OutlinedButton(onClick = onOpenMessages, modifier = Modifier.weight(1f)) {
+                    Text("Messages")
+                }
+                OutlinedButton(onClick = onOpenNetwork, modifier = Modifier.weight(1f)) {
+                    Text("Network")
                 }
             }
         }
@@ -106,17 +142,46 @@ fun HomeScreen(
 }
 
 @Composable
-private fun InfoCard(label: String, value: String) {
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(label, style = MaterialTheme.typography.bodyMedium)
-            Text(value, style = MaterialTheme.typography.bodyMedium)
+private fun StatusRow(meshActive: Boolean, gatewayState: GatewayConnectionState) {
+    Column {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(if (meshActive) "●" else "○", color = if (meshActive) Color(0xFF2E7D32) else Color.Gray)
+            Spacer(Modifier.width(6.dp))
+            Text(if (meshActive) "MESH ACTIVE" else "WAITING FOR NODES", style = MaterialTheme.typography.labelLarge)
         }
+        Spacer(Modifier.height(4.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            val connected = gatewayState == GatewayConnectionState.CONNECTED
+            Text(gatewayStatusIndicator(gatewayState), color = if (connected) Color(0xFF2E7D32) else Color.Gray)
+            Spacer(Modifier.width(6.dp))
+            Text("GATEWAY " + gatewayStatusLabel(gatewayState), style = MaterialTheme.typography.labelLarge)
+        }
+    }
+}
+
+@Composable
+private fun InfoLine(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(label, style = MaterialTheme.typography.bodyMedium)
+        Text(value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+private fun EmergencyButton(
+    label: String,
+    color: Color,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    Button(
+        onClick = onClick,
+        modifier = modifier.height(56.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = color)
+    ) {
+        Text(label, style = MaterialTheme.typography.bodyMedium)
     }
 }

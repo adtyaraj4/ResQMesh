@@ -12,34 +12,46 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+
+enum class MessageStatus {
+    STORED,        // no peer available on any transport yet, queued locally
+    FORWARDED,     // sent out on at least one transport (Nearby and/or BLE)
+    GATEWAY_SENT,  // sent out specifically while the BLE gateway had a connected peer
+    RECEIVED,      // arrived from the network, addressed to (or broadcast for) this node
+    ACKNOWLEDGED,  // reserved for when ACK round-trip is wired up (not yet reachable)
+    EXPIRED        // TTL hit zero before it could be forwarded further
+}
+
+enum class MessageDirection { OUTGOING, INCOMING }
+
+data class TrackedMessage(
+    val packet: MeshPacket,
+    val status: MessageStatus,
+    val direction: MessageDirection,
+    val lastUpdatedMillis: Long
+)
+
+data class NetworkStats(
+    val queued: Int = 0,
+    val forwarded: Int = 0,
+    val received: Int = 0
+)
 
 /**
- * Transport-agnostic mesh routing engine.
+ * Transport-agnostic mesh routing engine with in-memory store-and-forward
+ * and per-message status tracking for the UI.
  *
- * Owns a set of [MeshTransport] implementations (today: just
- * [NearbyMeshTransport] wrapping the existing tested Nearby Connections
- * transport). It:
+ * Store-and-forward here is IN-MEMORY ONLY — a queued message survives
+ * peers coming and going while the app process is alive (which is what
+ * the 3-phone demo scenario needs: Phone A stores until Phone B is in
+ * range, then auto-forwards with no re-press of the button), but does
+ * NOT survive an app restart or device reboot. Persisting the queue
+ * (e.g. via Room) is a follow-up, not done here.
  *
- *  - deduplicates by messageId (Section "DUPLICATE PROTECTION")
- *  - decrements TTL / increments hopCount on every forward, and stops
- *    forwarding at ttl <= 0 (Section "MULTI-HOP")
- *  - prevents immediate echo back to the peer/transport a packet just
- *    arrived from (Section "LOOP PREVENTION")
- *  - delivers packets addressed to this node (or broadcast) to the app
- *    layer via [deliveredPackets]
- *
- * CURRENTLY OUT OF SCOPE (deferred to the BLE/ESP32 increment — adding
- * them here now, before there's a second real transport to route
- * between, would be logic nobody can exercise or verify):
- *  - ACK packets and delivery-confirmation tracking
- *  - persistent store-and-forward across app restarts / gateway
- *    reconnects (packets not yet deliverable are currently held only
- *    in each transport's own in-memory queue, if any — there is no
- *    cross-restart persistence yet)
- *
- * Register additional transports (Esp32BleTransport, etc.) via the
- * constructor list — no changes needed here when they're added, which
- * is the point of the MeshTransport interface.
+ * ACK packets are not yet round-tripped end-to-end, so MessageStatus.ACKNOWLEDGED
+ * is defined but currently unreachable — it's there so the UI/status model
+ * doesn't need to change again once ACK is wired up.
  */
 class MeshManager(
     private val localNodeId: String,
@@ -48,22 +60,24 @@ class MeshManager(
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    // messageId -> time first seen. Used for dedup; entries older than
-    // seenMessageTtlMillis are lazily evicted on insert.
     private val seenMessages = ConcurrentHashMap<String, Long>()
-
-    // Most recent known peer list per transport, kept up to date by
-    // collecting each transport's observeConnections(). Needed so
-    // forwarding can address individual peers (to exclude the sender)
-    // instead of only blind-broadcasting.
     private val peersByTransport = ConcurrentHashMap<TransportType, List<TransportPeer>>()
+
+    private val pendingLock = Any()
+    private val pendingOutgoing = mutableListOf<MeshPacket>()
+
+    private val messageLogMap = ConcurrentHashMap<String, TrackedMessage>()
+    private val _messageLog = MutableStateFlow<List<TrackedMessage>>(emptyList())
+    val messageLog: StateFlow<List<TrackedMessage>> = _messageLog.asStateFlow()
+
+    private val forwardedCounter = AtomicInteger(0)
+    private val receivedCounter = AtomicInteger(0)
+    private val _networkStats = MutableStateFlow(NetworkStats())
+    val networkStats: StateFlow<NetworkStats> = _networkStats.asStateFlow()
 
     private val _allConnections = MutableStateFlow<List<TransportPeer>>(emptyList())
     val allConnections: StateFlow<List<TransportPeer>> = _allConnections.asStateFlow()
 
-    // Packets addressed to this node, or broadcast (destinationNodeId == null),
-    // surfaced for the app/UI layer. Every packet here has already been
-    // through dedup — the UI will never see the same messageId twice.
     private val _deliveredPackets = MutableSharedFlow<MeshPacket>(extraBufferCapacity = 64)
     val deliveredPackets: SharedFlow<MeshPacket> = _deliveredPackets.asSharedFlow()
 
@@ -80,6 +94,7 @@ class MeshManager(
                 transport.observeConnections().collect { peers ->
                     peersByTransport[transport.transportType] = peers
                     recomputeAllConnections()
+                    retryPendingMessages()
                 }
             }
 
@@ -97,15 +112,39 @@ class MeshManager(
     }
 
     /**
-     * Originates a brand-new packet from THIS node (e.g. the user pressed
-     * SOS). Marks it seen (so if it loops back through the mesh we don't
-     * re-broadcast our own message) and sends it out every transport to
-     * every currently connected peer.
+     * Originates a brand-new packet from THIS node (an emergency button
+     * press). If no peer is connected on any transport right now, the
+     * packet is queued (status STORED) instead of dropped, and will be
+     * sent automatically the moment any transport reports a connection —
+     * no re-press required, per the store-and-forward requirement.
      */
     suspend fun originate(packet: MeshPacket) {
         markSeen(packet.messageId)
-        _deliveredPackets.tryEmit(packet) // so the originating device's own UI shows it too
-        broadcastToAllTransports(packet)
+        _deliveredPackets.tryEmit(packet)
+
+        if (hasAnyConnectedPeer()) {
+            broadcastToAllTransports(packet)
+            updateLog(packet, statusForFreshSend(), MessageDirection.OUTGOING)
+        } else {
+            synchronized(pendingLock) { pendingOutgoing.add(packet) }
+            updateLog(packet, MessageStatus.STORED, MessageDirection.OUTGOING)
+        }
+        publishStats()
+    }
+
+    private suspend fun retryPendingMessages() {
+        if (!hasAnyConnectedPeer()) return
+        val toSend = synchronized(pendingLock) {
+            val copy = pendingOutgoing.toList()
+            pendingOutgoing.clear()
+            copy
+        }
+        if (toSend.isEmpty()) return
+        toSend.forEach { packet ->
+            broadcastToAllTransports(packet)
+            updateLog(packet, statusForFreshSend(), MessageDirection.OUTGOING)
+        }
+        publishStats()
     }
 
     private suspend fun handleIncoming(packet: MeshPacket, fromTransport: TransportType) {
@@ -114,43 +153,46 @@ class MeshManager(
             return
         }
         if (isSeen(packet.messageId)) {
-            // Duplicate — already processed (or currently being processed
-            // by another transport that received the same broadcast).
-            return
+            return // duplicate — already processed, never re-notify/re-forward
         }
         markSeen(packet.messageId)
 
         val forThisNode = packet.destinationNodeId == null || packet.destinationNodeId == localNodeId
         if (forThisNode) {
+            receivedCounter.incrementAndGet()
+            updateLog(packet, MessageStatus.RECEIVED, MessageDirection.INCOMING)
             _deliveredPackets.tryEmit(packet)
         }
 
-        // Broadcast/emergency packets (destinationNodeId == null) always
-        // continue relaying. A packet addressed to a specific OTHER node
-        // also continues relaying (we're just a hop). A packet addressed
-        // to exactly this node stops here.
         val shouldForward = packet.destinationNodeId == null || packet.destinationNodeId != localNodeId
-        if (!shouldForward) return
+        if (!shouldForward) {
+            publishStats()
+            return
+        }
 
         val forwarded = packet.forwarded()
         if (forwarded.isExpired) {
             Log.d(TAG, "TTL expired for ${packet.messageId}, not forwarding further")
+            if (forThisNode) updateLog(packet, MessageStatus.EXPIRED, MessageDirection.INCOMING)
+            publishStats()
             return
         }
 
-        // Loop prevention: the primary mechanism here is the dedup cache
-        // above (Section "LOOP PREVENTION" lists the seen-message cache as
-        // a valid standalone mechanism). Excluding the exact peer/transport
-        // a packet arrived from is a further refinement that requires each
-        // MeshTransport to report the origin peerId alongside a packet,
-        // which the current MeshTransport.observeIncomingPackets() signature
-        // does not carry. Flagged as a follow-up for the BLE increment,
-        // where a second real transport makes this loop case testable.
         broadcastToAllTransports(forwarded)
+        forwardedCounter.incrementAndGet()
+        publishStats()
     }
 
     private suspend fun broadcastToAllTransports(packet: MeshPacket) {
         transports.forEach { transport -> transport.broadcast(packet) }
+    }
+
+    private fun hasAnyConnectedPeer(): Boolean =
+        peersByTransport.values.any { it.isNotEmpty() }
+
+    private fun statusForFreshSend(): MessageStatus {
+        val gatewayConnected = peersByTransport[TransportType.BLE_GATEWAY]?.isNotEmpty() == true
+        return if (gatewayConnected) MessageStatus.GATEWAY_SENT else MessageStatus.FORWARDED
     }
 
     private fun isSeen(messageId: String): Boolean {
@@ -169,6 +211,25 @@ class MeshManager(
 
     private fun recomputeAllConnections() {
         _allConnections.value = peersByTransport.values.flatten()
+    }
+
+    private fun updateLog(packet: MeshPacket, status: MessageStatus, direction: MessageDirection) {
+        messageLogMap[packet.messageId] = TrackedMessage(
+            packet = packet,
+            status = status,
+            direction = direction,
+            lastUpdatedMillis = System.currentTimeMillis()
+        )
+        _messageLog.value = messageLogMap.values.sortedByDescending { it.lastUpdatedMillis }
+    }
+
+    private fun publishStats() {
+        val queued = synchronized(pendingLock) { pendingOutgoing.size }
+        _networkStats.value = NetworkStats(
+            queued = queued,
+            forwarded = forwardedCounter.get(),
+            received = receivedCounter.get()
+        )
     }
 
     companion object {

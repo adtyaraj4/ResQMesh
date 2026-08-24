@@ -1,0 +1,4 @@
+#Sun Aug 23 18:20:08 IST 2026
+base.0=C\:\\Users\\Aditya\\Downloads\\ResQMesh-MVP\\ResQMesh\\app\\build\\intermediates\\dex\\debugAndroidTest\\mergeProjectDexDebugAndroidTest\\0\\classes.dex
+renamed.0=classes.dex
+path.0=0/classes.dex

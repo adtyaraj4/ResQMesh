@@ -7,34 +7,24 @@ import java.util.UUID
 
 @Serializable
 enum class MeshPacketType {
-    MEDICAL,
-    INJURED,
-    FIRE,
     TRAPPED,
-    ACCIDENT,
-    FLOOD,
-    OTHER,
-    SOS,
+    MEDICAL,
+    EVACUATION,
+    SUPPLIES,
+    SAFE,
     ACK
 }
 
 /**
- * Default priority per emergency type. All life-safety categories are
- * CRITICAL; OTHER is MEDIUM since it's an unclassified/non-urgent report
- * by definition. This mapping is a deliberate simplification for the
- * prototype — Section 8 of the original spec's 5-level priority scheme
- * doesn't cleanly cover this exact type list, so this is the one place
- * to adjust weighting later without touching routing code.
+ * Priority per emergency type, exactly as specified:
+ * TRAPPED=5, MEDICAL=5 (CRITICAL), EVACUATION=4 (HIGH), SUPPLIES=3 (MEDIUM), SAFE=1 (STATUS).
  */
 fun MeshPacketType.defaultPriority(): MeshPriority = when (this) {
-    MeshPacketType.SOS,
-    MeshPacketType.MEDICAL,
-    MeshPacketType.INJURED,
-    MeshPacketType.FIRE,
     MeshPacketType.TRAPPED,
-    MeshPacketType.ACCIDENT,
-    MeshPacketType.FLOOD -> MeshPriority.CRITICAL
-    MeshPacketType.OTHER -> MeshPriority.MEDIUM
+    MeshPacketType.MEDICAL -> MeshPriority.CRITICAL
+    MeshPacketType.EVACUATION -> MeshPriority.HIGH
+    MeshPacketType.SUPPLIES -> MeshPriority.MEDIUM
+    MeshPacketType.SAFE -> MeshPriority.STATUS
     MeshPacketType.ACK -> MeshPriority.HIGH
 }
 
